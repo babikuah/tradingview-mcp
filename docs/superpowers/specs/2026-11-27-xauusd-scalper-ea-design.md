@@ -163,7 +163,10 @@ Definisi:
 
 - `ProjEquityAtSL` = balance + jumlah P/L semua posisi EA **seandainya semuanya ditutup di SL masing-masing**, termasuk komisi dan swap berjalan, **ditambah posisi baru yang diusulkan**, dengan buffer slippage `SLSlippageBuffer` (default $0.30 jarak harga per posisi).
 - `DayFloor` = ekuitas saat awal hari server × (1 − `DailyLossPct`), default 10%.
-- `GlobalFloor` = HWM × (1 − `MaxDrawdownPct`), default 50%. HWM adalah balance tertinggi yang pernah dicapai, minimal deposit awal.
+- `GlobalFloor` = HWM × (1 − `MaxDrawdownPct`), default 50%.
+  - HWM adalah balance tertinggi sejak `RiskStartDate`, dihitung ulang dari riwayat deal di server.
+  - HWM disesuaikan dengan arus kas. Deposit menaikkan HWM sebesar jumlah deposit, dan penarikan menurunkan HWM sebesar jumlah penarikan. Dengan begitu penarikan profit tidak memicu rem.
+  - *(Keputusan perancang.)*
 - `BasketWorstLoss` = P/L kelompok itu kalau semua posisinya kena SL, termasuk posisi baru.
 
 Order hanya boleh dikirim kalau **semua** syarat ini benar:
@@ -182,7 +185,11 @@ Ilustrasi kenapa posisi biasanya sedikit (dengan ATR M15 sekitar $8, lot dasar 0
 Rem ini berjalan setiap tick, independen dari gerbang. Gunanya menangkap gap atau slippage yang membuat ekuitas turun melewati batas walaupun ada SL.
 
 - **Harian:** kalau ekuitas ≤ `DayFloor`, semua posisi EA ditutup dan EA berhenti membuka posisi sampai hari server berikutnya.
-- **Global:** kalau ekuitas ≤ `GlobalFloor`, semua posisi EA ditutup dan EA **berhenti permanen**. EA baru jalan lagi kalau pengguna mengubah input `ResetGlobalStop = true` secara sadar. Statusnya disimpan supaya tidak hilang saat restart.
+- **Global:** kalau ekuitas ≤ `GlobalFloor`, semua posisi EA ditutup dan EA **berhenti permanen**.
+  - Status berhenti tidak perlu disimpan. Karena HWM dihitung dari riwayat deal, setelah restart ekuitas tetap di bawah batas dan EA tetap berhenti.
+  - Satu-satunya cara menjalankan lagi adalah pengguna dengan sadar mengubah input `RiskStartDate` ke tanggal baru. HWM lalu dihitung mulai tanggal itu, yaitu dari balance saat ini.
+  - **Konsekuensinya:** setelah reset, total rugi dihitung dari modal awal bisa melebihi 50%. Panel dan README menyatakannya dengan jelas.
+  - *(Keputusan perancang.)*
 
 ### 6.8 Filter
 
@@ -195,7 +202,13 @@ Rem ini berjalan setiap tick, independen dari gerbang. Gunanya menangkap gap ata
 
 - Magic number unik per instance EA. EA hanya mengelola posisinya sendiri.
 - Deteksi filling mode otomatis. Retry terbatas untuk requote atau harga berubah. Setiap order selalu dikirim dengan SL.
-- **Pemulihan state setelah restart:** keanggotaan kelompok (ticket → id kelompok, indeks layer, lot dasar, harga SL kelompok, puncak trailing) disimpan di file state (MQL5\Files). Komentar order hanya cadangan, karena sebagian broker menimpa komentar. Day-start equity, HWM, dan status rem disimpan di GlobalVariables terminal.
+- **Pemulihan state setelah restart:** semua state penting harus bisa **dibangun ulang dari data server saja**. File dan GlobalVariables hanya cache. Dengan begitu EA aman dijalankan di PC atau VPS sendiri maupun di Virtual Hosting MQL5, yang tidak ikut memindahkan file MQL5\Files maupun GlobalVariables. *(Keputusan perancang.)*
+  - **Keanggotaan kelompok** disandikan di magic number: `MagicNumber` + nomor slot, dengan slot = arah × `MaxBasketsPerDirection` + indeks kelompok. Slot dipakai ulang setelah kelompoknya tutup.
+  - **Urutan layer** diambil dari waktu buka posisi. **Lot dasar** diambil dari lot posisi pembuka. **SL kelompok** diambil dari SL posisi.
+  - **Puncak trailing kelompok** dimulai ulang dari P/L saat ini. Ini konservatif, karena puncak yang dimulai ulang tidak pernah lebih tinggi dari aslinya.
+  - **HWM** dihitung dari riwayat deal (6.6).
+  - **Ekuitas awal hari** disimpan di GlobalVariable. Kalau hilang, cadangannya adalah balance awal hari dari riwayat deal.
+  - Komentar order tidak dipakai sebagai sumber kebenaran, karena sebagian broker menimpanya.
 - Kalau ada posisi magic EA yang tidak dikenali di state, posisi itu dimasukkan sebagai kelompok sendiri dengan SL yang sudah ada. Kalau tidak punya SL, EA memasang SL darurat sesuai aturan 6.4.
 
 ### 6.10 Panel di chart
@@ -219,7 +232,7 @@ Panel teks (Comment) menampilkan: balance, ekuitas, HWM, P/L hari ini, sisa jata
 | Trailing | `TrailStart` / `TrailLock` / `TrailDistance` / `TrailStep` | $2.00 / $0.50 / $1.50 / $0.50 |
 | Trailing | `BasketTrailStartPer001` / `BasketTrailDropPct` | $3 / 30% |
 | Risiko | `DailyLossPct` / `MaxDrawdownPct` / `BasketRiskPct` | 10% / 50% / 5% |
-| Risiko | `SLSlippageBuffer` / `MinMarginLevelPct` / `ResetGlobalStop` | $0.30 / 300% / false |
+| Risiko | `SLSlippageBuffer` / `MinMarginLevelPct` / `RiskStartDate` | $0.30 / 300% / kosong (sejak deposit pertama) |
 | Filter | `MaxSpreadPoints` / `NoTradeStart` / `NoTradeEnd` | 40 / 23:30 / 01:30 |
 | Filter | `NewsFilter` / `NewsMinutesBefore` / `NewsMinutesAfter` | true / 30 / 30 |
 | Filter | `FridayNoNewHour` / `CloseBeforeWeekend` / `FridayCloseHour` | 20 / true / 22 |
@@ -272,17 +285,18 @@ Untuk setiap sinyal aturan dalam histori:
   2. Sinyal yang tersisa ≥ 30% dari total.
   3. Di Strategy Tester MT5 (real ticks) pada periode uji yang sama: drawdown maksimal dengan ML ≤ drawdown tanpa ML, dan profit bersih dengan ML ≥ tanpa ML.
 - **Kalau tidak lulus**, default `MLEnabled` diubah menjadi `false` dan hasilnya dilaporkan apa adanya ke pengguna.
+- **Periode uji tidak boleh dipakai untuk menyetel apa pun**, termasuk parameter aturan EA, supaya hasil uji tetap jujur. Kalau aturan EA disetel di MT5 (optimisasi), penyetelan hanya boleh memakai periode latihan ditambah validasi. *(Keputusan perancang.)*
 
 ### 8.6 ONNX di EA dan cek paritas
 
-- Model dimuat dari file (`MLModelFile`). Ada `#property tester_file` supaya model ikut terbawa di Strategy Tester. Dengan cara ini pengguna bisa mengganti model hasil latih ulang tanpa mengubah kode. Kalau pembangun memilih cara lain, syarat ini tetap harus dipenuhi.
+- Model **ditanam di dalam file `.ex5`** sebagai `#resource` (`models/xau_filter.onnx`). Cara ini paling andal karena model ikut ke Strategy Tester maupun ke Virtual Hosting. Mengganti model hasil latih ulang tidak perlu mengubah kode: cukup timpa file `.onnx`, kompilasi ulang di MetaEditor, lalu pasang ulang EA. Kalau EA berjalan di Virtual Hosting, lakukan migrasi ulang. *(Keputusan perancang.)*
 - Kalau `MLEnabled = true` tapi model gagal dimuat atau bentuk input dan outputnya tidak cocok, EA **tidak membuka kelompok baru** (fail-safe) dan menampilkan galat di panel dan log. Posisi yang sudah terbuka tetap dikelola.
 - **Cek kesetaraan ONNX:** keluaran model asli dan keluaran ONNX (lewat onnxruntime) harus sama untuk set uji, dengan selisih ≤ 1e-5.
 - **Cek paritas fitur:** dengan `DebugFeatureLog = true`, EA menulis vektor fitur setiap sinyal ke CSV. Skrip `parity_check.py` membandingkannya dengan fitur Python untuk bar yang sama. Toleransinya 1e-4, dan wajib lulus sebelum model dipakai.
 
 ### 8.7 Latih ulang
 
-Prosedur bulanan didokumentasikan di README: ekspor data, latih, cek kelulusan, salin `.onnx` ke folder MT5, lalu restart EA.
+Prosedur bulanan didokumentasikan di README: ekspor data, latih, cek kelulusan, timpa `models/xau_filter.onnx`, kompilasi ulang, lalu pasang ulang EA. Kalau EA berjalan di Virtual Hosting, lakukan migrasi ulang.
 
 ## 9. Pengujian
 
